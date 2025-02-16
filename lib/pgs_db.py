@@ -1,4 +1,4 @@
-# (C) https://github.com/perfguru87/pg-tools
+# (C) https://github.com/perfguru87/pgs-tools
 # Apache-2.0 license
 
 import os

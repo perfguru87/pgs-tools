@@ -972,7 +972,7 @@ class PgInfo(DBReport):
 
 
 def main():
-    print("pg-info version: %3s" % VERSION)
+    print("pgs-info version: %3s" % VERSION)
 
     test_description = "%prog [options] [REPORT_FILE1, [REPORT_FILE2, ...]]"
 

@@ -21,7 +21,7 @@ from optparse import OptionParser, OptionGroup
 import logging
 
 #########################################################################################
-# pg-warmupper.py specific code
+# pgs-warmupper.py specific code
 #########################################################################################
 
 VERSION = '1.1'

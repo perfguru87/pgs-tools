@@ -149,7 +149,7 @@ class PgPs(DBReport):
 
 
 def main():
-    print("pg-ps version: %3s" % VERSION)
+    print("pgs-ps version: %3s" % VERSION)
 
     test_description = "%prog [options]"
 
