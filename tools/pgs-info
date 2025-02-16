@@ -1,0 +1,1016 @@
+#!/usr/bin/python3
+
+# (C) https://github.com/perfguru87/pgs-tools
+# Apache-2.0 license
+
+import os
+import sys
+import time
+import re
+
+from optparse import OptionParser, OptionGroup
+import logging
+
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+    from pgs_db import DB
+    from pgs_common import configure_logging
+    import pgs_report as R
+    from pgs_report import RTableCol as C
+    from pgs_db_report import DBReport
+    from pgs_repaggr import RAFetcher, RAComparator
+except ImportError:
+    from pgs_tools.pgs_db import DB
+    from pgs_tools.pgs_common import configure_logging
+    import pgs_tools.pgs_report as R
+    from pgs_tools.pgs_report import RTableCol as C
+    from pgs_tools.pgs_db_report import DBReport
+    from pgs_tools.pgs_repaggr import RAFetcher, RAComparator
+
+
+VERSION = '1.0'
+
+#############################################################################################
+# Report comparator
+#############################################################################################
+
+class _cmpBase:
+    title = ""
+    sections = ["xxx"]
+    rows_top_bottom_colors = None
+
+    def sect_begin(self, line):
+        for section in self.sections:
+            if line.startswith(section):
+                return True
+        return False
+
+    def sect_end(self, line):
+        return line.startswith("=" * 10)
+
+    def line_parse(self, line):
+        return False, False
+
+    def kmg2int(self, val, metrics):
+        try:
+            val = float(val)
+        except ValueError:
+            logging.warning("can't convert '%s' to float" % str(val))
+            val = 0
+
+        _val = val
+        metrics = metrics.lower()
+        if metrics == "mb":
+            val *= 1024 * 1024
+        elif metrics == "kb":
+            val *= 1024
+        elif metrics == "gb":
+            val *= 1024 * 1024 * 1024
+        return int(val)
+
+
+class _cmpTablesSize(_cmpBase):
+    title = "Tables total size (GB)"
+    sections = ["All tables sorted by TOTAL_SZ size on disk"]
+    line_regexp = re.compile(r"\s+(\w+)\s+(\d+\.?\d?)\s+(\w[Bb]).*")
+    rows_top_bottom_colors = True
+
+    def line_parse(self, line):
+        m = self.line_regexp.match(line)
+        if not m:
+            return None, None
+
+        tname = m.groups()[0]
+        return "%s" % tname, "%.2f" % (self.kmg2int(m.groups()[1], m.groups()[2]) / (1024 * 1024 * 1024.0))
+
+
+class _cmpTablesBloat(_cmpBase):
+    title = "Tables bloat size (GB)"
+    sections = ["All tables sorted by BLOAT_SZ"]
+    line_regexp = re.compile(r"\s+(\w+)\s+(\d+\.?\d?)\s+(\w[Bb]).*?(\d+\.?\d?%)")
+    rows_top_bottom_colors = False
+
+    def line_parse(self, line):
+        m = self.line_regexp.match(line)
+        if not m:
+            return None, None
+
+        val = m.groups()[1]
+        metrics = m.groups()[2]
+        perc = m.groups()[3]
+
+        val = self.kmg2int(val, metrics)
+
+        if val < (50 * 1024) and perc < 0.05:
+            return None, None
+
+        tname = m.groups()[0]
+        return "%s" % tname, "%.3f" % (val / (1024 * 1024 * 1024.0))
+
+
+class PgInfoCmp:
+    def __init__(self, filenames, opts=None):
+
+        html = opts and hasattr(opts, "html") and opts.html
+        filestream = open(html, 'w') if html else sys.stdout
+
+        for cl in [_cmpTablesSize, _cmpTablesBloat]:
+
+            o = cl()
+
+            rfs = []
+            for f in filenames:
+                rfs.append(RAFetcher(filename=f, line_parser=o.line_parse,
+                                     section_begin_parser=o.sect_begin, section_end_parser=o.sect_end))
+            rc = RAComparator(cl.sections[0], rfs, table_title=cl.title, rows_top_bottom_colors=o.rows_top_bottom_colors)
+            rc.dump(format="html" if html else "text", filestream=filestream)
+
+
+#############################################################################################
+# Report generator
+#############################################################################################
+
+class PgInfo(DBReport):
+    def __init__(self, lines_limit=20, transaction_threshold=120):
+        DBReport.__init__(self)
+        self.lines_limit = lines_limit
+        self.tran_threshold = transaction_threshold
+
+    def print_db_settings(self):
+        q = """
+        select
+            category,
+            name,
+            setting as value,
+            (case when unit = '8kB' then pg_size_pretty(setting::bigint * 1024 * 8) when unit = 'kB' and setting <> '-1' then pg_size_pretty(setting::bigint * 1024) else '' end) as pretty_value,
+            coalesce(unit, '') unit,
+            (case when source = 'configuration file' then 'conf file' else
+                  (case when source = 'environment variable' then 'env var' else source end) end) as source
+        from pg_settings
+        where category in (
+            'Connections and Authentication / Connection Settings',
+            'Replication / Sending Servers',
+            'Reporting and Logging / What to Log',
+            'Lock Management',
+            'Query Tuning / Other Planner Options',
+            'Write-Ahead Log / Settings',
+            'Statistics / Query and Index Statistics Collector',
+            'Resource Usage / Background Writer',
+            'Reporting and Logging / When to Log',
+            'Autovacuum',
+            'Resource Usage / Cost-Based Vacuum Delay',
+            'Resource Usage / Memory',
+            'Reporting and Logging / Where to Log',
+            'Preset Options',
+            'Write-Ahead Log / Checkpoints'
+        )
+        order by name"""
+
+        ret = self.execute_fetchall(q)
+        col = [('CATEGORY', -30), ('NAME*', -30), 'VALUE', 'PRETTY_VALUE', 'UNIT', 'SOURCE']
+
+        self.add_table("Database settings", col, ret)
+
+    def pprint_db_stats(self):
+        s = self.add_section("Database statistics")
+
+        if (self.vermajor_a == 9) and (self.vermajor_b == 0):
+            q = """select datname, numbackends, xact_commit, xact_rollback, 'N/A' deadlocks, 'N/A' stats_reset
+                     from pg_stat_database
+                    where datname not in ('template1', 'template0')
+                    order by datname"""
+        elif (self.vermajor_a == 9) and (self.vermajor_b == 1):
+            q = """select datname, numbackends, xact_commit, xact_rollback, 'N/A' deadlocks, to_char(stats_reset, 'yyyy-mm-dd hh24:mi') stats_reset
+                     from pg_stat_database
+                    where datname not in ('template1', 'template0')
+                    order by datname"""
+        elif (self.vermajor_a == 9) and (self.vermajor_b > 1) or (self.vermajor_a > 9):
+            q = """select datname, numbackends, xact_commit, xact_rollback, deadlocks, to_char(stats_reset, 'yyyy-mm-dd hh24:mi') stats_reset
+                     from pg_stat_database
+                    where datname not in ('template1', 'template0')
+                    order by datname"""
+
+        ret = self.execute_fetchall(q)
+        col = ['DB*', 'SESSIONS', 'TX COMMITED', 'TX ROLLEDBACK', 'DEADLOCKS', 'STATISTICS SINCE']
+
+        self.add_table(s.add_section("All database statistics"), col, ret, autowidth=False)
+
+        q = """select datname, tup_returned, tup_fetched, tup_inserted, tup_updated, tup_deleted
+                 from pg_stat_database
+                where datname not in ('template1', 'template0')
+                order by datname"""
+
+        ret = self.execute_fetchall(q)
+        col = ['DB*', 'RETURNED', 'FETCHED', 'INSERTED', 'UPDATED', 'DELETED']
+
+        self.add_table(s.add_section("Tuples statistics"), col, ret, autowidth=False)
+
+        if (self.vermajor_a == 9) and (self.vermajor_b <= 1):
+            q = """select datname, blks_read, blks_hit, 100.0*blks_hit/nullif(blks_hit + blks_read, 0) AS hit_percent,
+                          'N/A' temp_files, 'N/A' temp_bytes, 'N/A' blk_read_time, 'N/A' blk_write_time
+                     from pg_stat_database
+                    where datname not in ('template1', 'template0')
+                    order by datname"""
+        elif (self.vermajor_a == 9) and (self.vermajor_b > 1) or (self.vermajor_a > 9):
+            q = """select datname, blks_read, blks_hit, 100.0*blks_hit/nullif(blks_hit + blks_read, 0) AS hit_percent,
+                          temp_files, pg_size_pretty(temp_bytes) temp_bytes, blk_read_time, blk_write_time
+                     from pg_stat_database
+                    where datname not in ('template1', 'template0')
+                    order by datname"""
+
+        ret = self.execute_fetchall(q)
+        col = ['DB*', 'NUM OF DISK\nBLOCK READS', 'NUM OF CACHE\nBLOCK HITS',
+               ('HIT%', 9, "%d%%"), ('TMP FILES\nCREATED', 9), ('TMP FILES\n WRITTEN', 15),
+               ('DISK BLOCK\nREAD TIME, MS', 15), ('DISK BLOCK\nWRITE TIME, MS', 15)]
+
+        self.add_table(s.add_section("I/O statistics"), col, ret, autowidth=False)
+
+    def print_bg_stats(self):
+        s = self.add_section("Background writer statistics")
+
+        if (self.vermajor_a == 9) and (self.vermajor_b == 0):
+            q = """select checkpoints_timed || ' (' || 100*checkpoints_timed/nullif(checkpoints_timed+checkpoints_req, 0) || '%)' chpt_timed,
+                          checkpoints_req || ' (' || 100*checkpoints_req/nullif(checkpoints_timed+checkpoints_req, 0) || '%)' chpt_req,
+                          pg_size_pretty(buffers_checkpoint * block_size / nullif(checkpoints_timed + checkpoints_req, 0)) AS avg_chpt_write,
+                          'N/A' checkpoint_write_time, 'N/A' checkpoint_sync_time, 'N/A' avg_checkpoint_interval,
+                          'N/A' avg_write_time, 'N/A' avg_sync_time, 'N/A' stats_reset
+                     from pg_stat_bgwriter, (SELECT cast(current_setting('block_size') AS integer) AS block_size) AS bs"""
+        elif (self.vermajor_a == 9) and (self.vermajor_b == 1):
+            q = """select checkpoints_timed || ' (' || 100*checkpoints_timed/nullif(checkpoints_timed+checkpoints_req, 0) || '%)' chpt_timed,
+                          checkpoints_req || ' (' || 100*checkpoints_req/nullif(checkpoints_timed+checkpoints_req, 0) || '%)' chpt_req,
+                          pg_size_pretty(buffers_checkpoint * block_size / nullif(checkpoints_timed + checkpoints_req, 0)) AS avg_chpt_write,
+                          'N/A' checkpoint_write_time, 'N/A' checkpoint_sync_time,
+                          round(extract('epoch' from now() - stats_reset)::numeric/nullif(checkpoints_timed+checkpoints_req, 0), 2) avg_checkpoint_interval,
+                          'N/A' avg_write_time, 'N/A' avg_sync_time,
+                           to_char(stats_reset, 'yyyy-mm-dd hh24:mi') || ' (' || date_trunc('second', now()) - date_trunc('second',stats_reset) || ')' stats_reset
+                     from pg_stat_bgwriter, (SELECT cast(current_setting('block_size') AS integer) AS block_size) AS bs"""
+        elif (self.vermajor_a == 9) and (self.vermajor_b > 1) or (self.vermajor_a > 9):
+            q = """select checkpoints_timed || ' (' || 100*checkpoints_timed/nullif(checkpoints_timed+checkpoints_req, 0) || '%)' chpt_timed,
+                          checkpoints_req || ' (' || 100*checkpoints_req/nullif(checkpoints_timed+checkpoints_req, 0) || '%)' chpt_req,
+                          pg_size_pretty(buffers_checkpoint * block_size / nullif(checkpoints_timed + checkpoints_req, 0)) AS avg_chpt_write,
+                          round(checkpoint_write_time::numeric/1000, 2) checkpoint_write_time, round(checkpoint_sync_time::numeric/1000, 2) checkpoint_sync_time,
+                          round(extract('epoch' from now() - stats_reset)::numeric/nullif(checkpoints_timed+checkpoints_req, 0), 2) avg_checkpoint_interval,
+                          round(checkpoint_write_time::numeric/nullif(checkpoints_timed+checkpoints_req, 0)/1000, 2) avg_write_time,
+                          round(checkpoint_sync_time::numeric/nullif(checkpoints_timed+checkpoints_req, 0)/1000, 2) avg_sync_time,
+                          to_char(stats_reset, 'yyyy-mm-dd hh24:mi') || ' (' || date_trunc('second', now()) - date_trunc('second', stats_reset) || ')' stats_reset
+                     from pg_stat_bgwriter, (SELECT cast(current_setting('block_size') AS integer) AS block_size) AS bs"""
+
+        ret = self.execute_fetchall(q)
+        col = [('SCHEDULED\nCHKPOINTS', 12), ('REQUESTED\nCHKPOINTS', 12), ('AVG CHKPOINT\nSIZE', 0),
+               ('CHKPOINTS WRITE\nTIME, SEC', 16), ('CHKPOINTS FSYNC\nTIME, SEC', 16), ('AVG CHKPOINTS\nINTERVAL, SEC', 0),
+               ('AVG WRITE\nTIME, SEC', 0), ('AVG FSYNC\nTIME, SEC', 0), ('STATISTICS\nSINCE', 40)]
+
+        self.add_table(s, col, ret)
+
+        hint = "HINT: If scheduled checkpoints execution is less than 90%, consider increasing the checkpoint_segments/max_wal_size value\n" + \
+               "      If scheduled checkpoints execution is 90% or more and average checkpoint size is less than 25MB, consider increasing\n" + \
+               "      the checkpoint_interval value"
+
+        col = [('SCHEDULED\nCHKPOINTS', 0), ('REQUESTED\nCHKPOINTS', 0), ('AVG CHKPOINT\nSIZE', 15),
+               ('CHKPOINTS WRITE\nTIME, SEC', 0), ('CHKPOINTS FSYNC\nTIME, SEC', 0), ('AVG CHKPOINT\nINTERVAL, SEC', 15),
+               ('AVG WRITE\nTIME, SEC', 15), ('AVG FSYNC\nTIME, SEC', 15), ('STATISTICS\nSINCE', 0)]
+        self.add_table(s, col, ret, hint)
+
+        if (self.vermajor_a == 9) and (self.vermajor_b == 0):
+            q = """select buffers_checkpoint || case when (buffers_checkpoint+buffers_clean+buffers_backend)>0 then ' (' || 100*buffers_checkpoint/(buffers_checkpoint+buffers_clean+buffers_backend) || '%)' else '' end chpt_blocks,
+                          buffers_clean || case when (buffers_checkpoint+buffers_clean+buffers_backend)>0 then ' (' || 100*buffers_clean/(buffers_checkpoint+buffers_clean+buffers_backend) || '%)' else '' end bgwr_blocks,
+                          maxwritten_clean || ' (' || round(case when maxpages=0 then 100.0 when buffers_clean=0 then 0.0 else 100.0*maxwritten_clean/(buffers_clean/maxpages) end, 2) || '%)' maxwritten_clean,
+                          buffers_backend || case when (buffers_checkpoint+buffers_clean+buffers_backend)>0 then ' (' || 100*buffers_backend/(buffers_checkpoint+buffers_clean+buffers_backend) || '%)' else '' end bknd_blocks,
+                          'NA' backend_fsync,
+                          buffers_alloc || case when (buffers_checkpoint+buffers_clean+buffers_backend)>0 then ' (' || 100*buffers_alloc/(buffers_checkpoint+buffers_clean+buffers_backend) || '%)' else '' end buffers_alloc
+                     from pg_stat_bgwriter, (SELECT cast(current_setting('bgwriter_lru_maxpages') AS integer) AS maxpages) AS mp"""
+        elif (self.vermajor_a == 9) and (self.vermajor_b == 1):
+            q = """select buffers_checkpoint || case when (buffers_checkpoint+buffers_clean+buffers_backend)>0 then ' (' || 100*buffers_checkpoint/(buffers_checkpoint+buffers_clean+buffers_backend) || '%)' else '' end chpt_blocks,
+                          buffers_clean || case when (buffers_checkpoint+buffers_clean+buffers_backend)>0 then ' (' || 100*buffers_clean/(buffers_checkpoint+buffers_clean+buffers_backend) || '%)' else '' end bgwr_blocks,
+                          maxwritten_clean || ' (' || round(case when maxpages=0 then 100.0 when buffers_clean=0 then 0.0 else 100.0*maxwritten_clean/(buffers_clean/maxpages) end, 2) || '%)' maxwritten_clean,
+                          buffers_backend || case when (buffers_checkpoint+buffers_clean+buffers_backend)>0 then ' (' || 100*buffers_backend/(buffers_checkpoint+buffers_clean+buffers_backend) || '%)' else '' end bknd_blocks,
+                          buffers_backend_fsync backend_fsync,
+                          buffers_alloc || case when (buffers_checkpoint+buffers_clean+buffers_backend)>0 then ' (' || 100*buffers_alloc/(buffers_checkpoint+buffers_clean+buffers_backend) || '%)' else '' end buffers_alloc
+                     from pg_stat_bgwriter, (SELECT cast(current_setting('bgwriter_lru_maxpages') AS integer) AS maxpages) AS mp"""
+        elif (self.vermajor_a == 9) and (self.vermajor_b > 1) or (self.vermajor_a > 9):
+            q = """select buffers_checkpoint || case when (buffers_checkpoint+buffers_clean+buffers_backend)>0 then ' (' || 100*buffers_checkpoint/(buffers_checkpoint+buffers_clean+buffers_backend) || '%)' else '' end chpt_blocks,
+                          buffers_clean || case when (buffers_checkpoint+buffers_clean+buffers_backend)>0 then ' (' || 100*buffers_clean/(buffers_checkpoint+buffers_clean+buffers_backend) || '%)' else '' end bgwr_blocks,
+                          maxwritten_clean || ' (' || round(case when maxpages=0 then 100.0 when buffers_clean=0 then 0.0 else 100.0*maxwritten_clean/(buffers_clean/maxpages) end, 2) || '%)' maxwritten_clean,
+                          buffers_backend || case when (buffers_checkpoint+buffers_clean+buffers_backend)>0 then ' (' || 100*buffers_backend/(buffers_checkpoint+buffers_clean+buffers_backend) || '%)' else '' end bknd_blocks,
+                          buffers_backend_fsync backend_fsync,
+                          buffers_alloc || case when (buffers_checkpoint+buffers_clean+buffers_backend)>0 then ' (' || 100*buffers_alloc/(buffers_checkpoint+buffers_clean+buffers_backend) || '%)' else '' end buffers_alloc
+                     from pg_stat_bgwriter, (SELECT cast(current_setting('bgwriter_lru_maxpages') AS integer) AS maxpages) AS mp"""
+
+        ret = self.execute_fetchall(q)
+
+        col = ['CHKPOINTS\nWRITTEN BUFFERS', 'BGWRITER\nWRITTEN BUFFERS',
+               'BGWRITER\nSTOPPED CLEANING', 'BACKEND\nWRITTEN BUFFERS', 'BACKEND\nFSYNC',
+               'BUFFERS\nALLOCATED']
+
+        hint = "HINT: If checkpoint written buffers is less than 75%, consider increasing the servers's RAM and shared_buffers value\n" + \
+               "      If buffer allocation happens too much, consider increasing the servers's RAM and shared_buffers value\n" + \
+               "      If bgwriter stops cleanin more often than 10%, consider increasing the bgwriter_lru_maxpages value"
+
+        self.add_table(s, col, ret, hint)
+
+    def print_schema_size(self):
+        q = """
+        SELECT
+            schema,
+            pg_size_pretty(total) AS total,
+            pg_size_pretty(relation) AS relation,
+            pg_size_pretty(indexes) AS indexes,
+            case when total > 0
+            THEN
+                100 * indexes / total
+            ELSE
+                0
+            END
+        FROM
+        (
+            SELECT
+                schema,
+                sum(pg_total_relation_size(qual_table))::bigint AS total,
+                sum(pg_relation_size(qual_table))::bigint AS relation,
+                sum(pg_indexes_size(qual_table))::bigint AS indexes
+            FROM
+            (
+                SELECT
+                    schemaname AS schema,
+                    tablename AS table,
+                    ('"'||schemaname||'"."'||tablename||'"')::regclass AS qual_table
+                FROM
+                    pg_tables
+                WHERE
+                    schemaname NOT LIKE 'pg_%'
+            ) s
+            GROUP BY schema
+            ORDER BY total DESC
+        ) s"""
+
+        ret = self.execute_fetchall(q)
+
+        col = ['SCHEMA', ('*TOTAL_SZ', 11), ('DATA_SZ', 11), ('INDEX_SZ', 11), ('INDEX_SZ%', 9, "%.0f%%")]
+
+        self.add_table("All schemas sorted by TOTAL_SZ size on disk", col, ret)
+
+    def print_tables_size(self):
+        q = """
+        SELECT res1.schema,
+               res1.tablename,
+               toast.relname,
+               res1.total_size_bytes,
+               pg_size_pretty(res1.total_size_bytes) as total_size,
+               pg_size_pretty(res1.tbl_size_bytes) as tbl_size,
+               pg_size_pretty(res1.idx_size_bytes) as idx_size,
+               pg_size_pretty(res1.total_size_bytes-res1.tbl_size_bytes-res1.idx_size_bytes) as toast_size,
+               CASE WHEN res1.total_size_bytes > 0
+                    THEN 100 * res1.idx_size_bytes / res1.total_size_bytes
+                    ELSE 0 end idx_size_proc,
+               res1.tbl_rows,
+               res1.col_count,
+               res1.idx_count,
+               CASE WHEN res1.col_count > 0 THEN 100 * res1.idx_count / res1.col_count ELSE 0 end idx_count_proc
+          FROM (SELECT ns.nspname as schema,
+                       tbl.relname as tablename,
+                       tbl.reltuples as tbl_rows,
+                       pg_total_relation_size(tbl.oid) as total_size_bytes,
+                       pg_relation_size(tbl.oid) as tbl_size_bytes,
+                       pg_indexes_size(tbl.oid) as idx_size_bytes,
+                       count(distinct c.column_name) col_count,
+                       count(distinct i.indexname) idx_count,
+                       tbl.reltoastrelid
+                FROM
+                    pg_class tbl
+                JOIN
+                    pg_namespace ns ON ns.oid = tbl.relnamespace
+                LEFT JOIN
+                    information_schema.columns c on c.table_schema = ns.nspname and c.table_name = tbl.relname
+                LEFT JOIN
+                    pg_indexes i on i.schemaname = ns.nspname and i.tablename = tbl.relname
+                WHERE
+                    nspname NOT IN ('pg_catalog', 'information_schema')
+                    AND tbl.relkind = 'r'
+                GROUP BY
+                    ns.nspname, tbl.relname, tbl.reltuples, tbl.oid
+                ORDER BY
+                    total_size_bytes desc
+                LIMIT %d) res1
+          LEFT JOIN
+              pg_class toast ON res1.reltoastrelid = toast.oid
+        """ % self.lines_limit
+
+        ret = self.execute_fetchall(q)
+
+        col = [('SCHEMA', 0), C('TABLE', left=True), C('TOAST', left=True), ('TOTAL BYTES', 0), '*TOTAL SZ', 'TABLE SZ',
+               'INDEX SZ', 'TOAST SZ', ('INDEX SZ%', 6, "%d%%"), ("ROWS", 10, "%d"),
+               ("COLUMNS", 7, "%d"), ("INDEXES", 7, "%d"), ("INDX%", 5, "%d")]
+
+        hint = "HINT: The bigger is table TOTAL_SZ the slower are all operations on this table"
+
+        self.add_table("All tables sorted by TOTAL_SZ size on disk", col, ret, hint)
+
+    def print_missing_indexes(self, pg_rel_size_threshold):
+        if pg_rel_size_threshold:
+            section = "Tables with size > %dKB and missing indexes" % (pg_rel_size_threshold / 1024)
+        else:
+            section = "All tables with missing indexes"
+
+        q = """
+        SELECT schemaname, relname, seq_scan, seq_tup_read, seq_tup_read / seq_scan as avg_seq_tup_read,
+               pg_size_pretty(pg_relation_size(relid)) AS rel_size
+          FROM pg_stat_all_tables
+         WHERE schemaname='public'
+           AND pg_relation_size(relid) >= %d
+           AND seq_scan > 0
+         ORDER BY avg_seq_tup_read DESC
+         LIMIT %d
+        """ % (pg_rel_size_threshold, self.lines_limit)
+
+        ret = self.execute_fetchall(q)
+
+        col = [('SCHEMA', 0), C('TABLE', left=True), 'SEQ SCAN', 'SEQ TUP READ', '*AVG TUP READ', 'TBL SIZE']
+
+        hint = "HINT: Probably, tables with big average number of fetched rows may be missing index\n" + \
+               "      or LIMIT clause is forgotten in the query using that table"
+
+        self.add_table(section, col, ret, hint)
+
+    def print_ineffective_indexes(self, pg_rel_size_threshold):
+        if pg_rel_size_threshold:
+            section = "Indexes with size > %dKB returning many rows" % (pg_rel_size_threshold / 1024)
+        else:
+            section = "All indexes with low cardinality"
+
+        q = """
+        SELECT schemaname, relname, indexrelname, idx_scan, idx_tup_read,
+               round(case idx_scan when 0 then 0 else (idx_tup_read::numeric/idx_scan) end, 2) avg_idx_tup_read,
+               pg_size_pretty(pg_relation_size(indexrelid)) AS rel_size
+          FROM pg_stat_all_indexes
+         WHERE pg_relation_size(indexrelid) >= %d
+           AND idx_scan > 0
+         ORDER BY avg_idx_tup_read DESC
+         LIMIT %d
+        """ % (pg_rel_size_threshold, self.lines_limit)
+
+        ret = self.execute_fetchall(q)
+
+        col = [('SCHEMA', 0), C('TABLE', left=True), C('INDEX', left=True), 'IDX SCAN', 'IDX TUP READ', '*AVG TUP_READ', 'IDX_SIZE']
+
+        hint = "HINT: Probably, using of indexes with big average number of rows read per scan is inefficiently\n" + \
+               "      or the query logic, that uses that index is dubious"
+
+        self.add_table(section, col, ret, hint)
+
+    def print_dead_indexes(self):
+        q = """
+        SELECT
+            relid::regclass AS table,
+            indexrelid::regclass AS index,
+            pg_size_pretty(pg_relation_size(indexrelid::regclass)) AS index_size,
+            pg_relation_size(indexrelid::regclass) AS index_size_bytes,
+            idx_scan,
+            idx_tup_read,
+            idx_tup_fetch
+        FROM
+            pg_stat_user_indexes
+            JOIN pg_index USING (indexrelid)
+        ORDER BY idx_scan ASC, index_size_bytes DESC
+         LIMIT %d
+        """ % (self.lines_limit)
+
+        ret = self.execute_fetchall(q)
+
+        col = [C('TABLE', -32), C('INDEX', left=True), '*IDX_SIZE', ('IDX SIZE BYTES', 0),
+               '*IDX SCAN', 'TUP READ', 'TUP FETCH']
+
+        hint = "HINT: The more IDX_SIZE value the more size is occupied for given index, if IDX_SCAN == 0 then\n" + \
+               "      this index is unused and can be just removed to increase INSERT/UPDATE performance"
+
+        self.add_table("Less frequently accessed indexes", col, ret, hint)
+
+    def print_vacuum_stats(self, pg_rel_size_threshold):
+        s = self.add_section("Autovacuum statistics")
+
+        q = """
+            SELECT relname, age(relfrozenxid) as xid_age, pg_size_pretty(pg_table_size(oid)) as table_size
+              FROM pg_class
+             WHERE relkind = 'r' and pg_table_size(oid) > %d
+             ORDER BY age(relfrozenxid) DESC
+             LIMIT %d
+        """ % (pg_rel_size_threshold, self.lines_limit)
+
+        ret = self.execute_fetchall(q)
+        if not ret:
+            ret = [["-//-", "-//-", "-//-"]]
+        col = [('TABLE', -31), '*XID AGE', 'SIZE']
+        hint = "HINT: Tables with age near to 'autovacuum_freeze_max_age' must be vacuumed"
+
+        self.add_table(s, col, ret, hint)
+
+        q = """
+            SELECT
+                ts.relname AS TABLE,
+                CASE WHEN pg_relation_size(ts.relid) > 15000 THEN pg_size_pretty(pg_relation_size(ts.relid))
+                    ELSE pg_relation_size(ts.relid)::text END AS tsize,
+                %s as n_mod_since_analyze,
+                CAST(
+                    (CAST(current_setting('autovacuum_analyze_threshold') AS bigint) +
+                    CAST(current_setting('autovacuum_analyze_scale_factor') AS numeric) * tc.reltuples) AS bigint) AS aanalyze_threshold,
+                coalesce(to_char(ts.last_autoanalyze, 'yyyy-mm-dd hh24:mi'), '-') "last autoanalyze",
+                coalesce(to_char(ts.last_analyze, 'yyyy-mm-dd hh24:mi'), '-') "last analyze",
+                ts.n_dead_tup,
+                CAST(
+                    (CAST(current_setting('autovacuum_vacuum_threshold') AS bigint) +
+                    CAST(current_setting('autovacuum_vacuum_scale_factor') AS numeric) * tc.reltuples) AS bigint) AS avacuum_threshold,
+                coalesce(to_char(ts.last_autovacuum, 'yyyy-mm-dd hh24:mi'), '-') "last autovacuum",
+                coalesce(to_char(ts.last_vacuum, 'yyyy-mm-dd hh24:mi'), '-') "last vacuum"
+            FROM pg_stat_user_tables ts
+            JOIN pg_class tc on ts.relid = tc.oid
+           where pg_relation_size(ts.relid) >= %d
+            %s
+            LIMIT %d"""
+
+        if ((self.vermajor_a == 9) and (self.vermajor_b > 3)) or (self.vermajor_a > 9):
+            q = q % ("ts.n_mod_since_analyze", pg_rel_size_threshold, "ORDER BY n_dead_tup DESC, n_mod_since_analyze desc", self.lines_limit)
+        else:
+            q = q % ("'NA'", pg_rel_size_threshold, "ORDER BY n_dead_tup DESC", self.lines_limit)
+
+        ret = self.execute_fetchall(q)
+        col = [('TABLE', -31), 'SIZE',
+               'TUPLES\nCHANGED', 'ANALYZE\nTHRESHOLD', 'LAST\nAUTO ANALYZE', 'LAST\nMANUAL ANALYZE',
+               '*TUPLES\nDEAD', 'VACUUM\nTHRESHOLD', 'LAST\nAUTO VACUUM', 'LAST\nMANUAL VACUUM']
+        hint = "HINT: Tables with dead tuples > vacuum threshold must be vacuumed"
+
+        self.add_table(s, col, ret, hint)
+
+    def print_tbl_bloat_info(self):
+        # see: https://github.com/ioguix/pgsql-bloat-estimation/blob/master/table/table_bloat.sql
+        q_after_12 = """select Res1.schema,
+                           Res1.tablename,
+                           Res1.bloat_size::bigint bloat_bytes,
+                           pg_size_pretty(Res1.bloat_size::bigint) bloat_human,
+                           pg_size_pretty(Res1.tt_size) table_human,
+                           pg_size_pretty(Res1.tt_size-Res1.bloat_size::bigint) clear_table_human,
+                           case Res1.tt_size when 0
+                                             then '0'
+                                             else round(Res1.bloat_size::numeric/Res1.tt_size*100, 2)||'%' end bloat_proc,
+                           Res1.tbltuples,
+                           Res1.tt_size table_bytes,
+                           to_char(Res1.last_vacuum, 'yyyy-mm-dd hh24:mi') last_vacuum,
+                           to_char(Res1.last_autovacuum, 'yyyy-mm-dd hh24:mi') last_autovacuum,
+                           to_char(Res1.last_analyze, 'yyyy-mm-dd hh24:mi') last_analyze,
+                           to_char(Res1.last_autoanalyze, 'yyyy-mm-dd hh24:mi') last_autoanalyze
+                      from (select res0.schema,
+                                   res0.tablename,
+                                   pg_table_size(res0.toid) tt_size,
+                                   pg_total_relation_size(res0.toid) to_size,
+                                   GREATEST((res0.heappages + res0.toastpages - (ceil(res0.reltuples/
+                                      ((res0.bs-res0.page_hdr) * res0.fillfactor/((4 + res0.tpl_hdr_size
+                                         + res0.tpl_data_size + (2 * res0.ma)
+                                         - CASE WHEN res0.tpl_hdr_size%res0.ma = 0
+                                                THEN res0.ma ELSE res0.tpl_hdr_size%res0.ma END
+                                         - CASE WHEN ceil(res0.tpl_data_size)::int%res0.ma = 0
+                                                THEN res0.ma ELSE ceil(res0.tpl_data_size)::int%res0.ma end)*100)))
+                                  + ceil(res0.toasttuples/4))) * res0.bs, 0) AS bloat_size,
+                                  st.last_vacuum,
+                                  st.last_autovacuum,
+                                  st.last_analyze,
+                                  st.last_autoanalyze,
+                                  res0.reltuples tbltuples
+                                  from (select tbl.oid toid, ns.nspname as schema,
+                                           tbl.relname as tablename,
+                                           tbl.reltuples,
+                                           tbl.relpages as heappages,
+                                           coalesce(substring(array_to_string(tbl.reloptions, ' ')
+                                                 FROM '%fillfactor=#"__#"%' FOR '#')::smallint, 100) AS fillfactor,
+                                           coalesce(toast.relpages, 0) AS toastpages,
+                                           coalesce(toast.reltuples, 0) AS toasttuples,
+                                           current_setting('block_size')::numeric AS bs,
+                                           24 as page_hdr,
+                                           CASE WHEN version()~'mingw32' OR version()~'64-bit|x86_64|ppc64|ia64|amd64'
+                                                THEN 8
+                                                ELSE 4 END AS ma,
+                                           bool_or(att.atttypid = 'pg_catalog.name'::regtype) AS is_na,
+                                           23 + CASE WHEN MAX(coalesce(s.null_frac,0)) > 0
+                                                     THEN ( 7 + count(*) ) / 8
+                                                     ELSE 0::int END + CASE WHEN bool_or(att.attname = 'oid' and att.attnum < 0) THEN 4 ELSE 0 END AS tpl_hdr_size,
+                                           sum( (1-coalesce(s.null_frac, 0)) * coalesce(s.avg_width, 1024) ) AS tpl_data_size
+                                          from pg_class tbl
+                                          JOIN pg_namespace AS ns ON ns.oid = tbl.relnamespace
+                                          join pg_attribute as att ON att.attrelid = tbl.oid
+                                          LEFT JOIN pg_class AS toast ON toast.oid = tbl.reltoastrelid
+                                          left JOIN pg_stats AS s ON s.schemaname=ns.nspname
+                                                AND s.tablename = tbl.relname AND s.inherited=false AND s.attname=att.attname
+                                          where tbl.relkind = 'r' and ns.nspname not in ('pg_catalog', 'information_schema')
+                                            and att.attnum > 0 AND NOT att.attisdropped
+                                          group by tbl.oid, ns.nspname, tbl.relname, tbl.reltuples, tbl.relpages,
+                                                   fillfactor, toastpages, toasttuples) Res0
+                                  left join pg_stat_all_tables st on Res0.schema = st.schemaname and Res0.tablename = st.relname) Res1
+                         order by bloat_size desc
+                         limit """ + str(self.lines_limit)
+
+        # see: https://github.com/ioguix/pgsql-bloat-estimation/blob/master/table/table_bloat-82-84.sql
+        q_before_12 = """select Res1.schema,
+                           Res1.tablename,
+                           Res1.bloat_size::bigint bloat_bytes,
+                           pg_size_pretty(Res1.bloat_size::bigint) bloat_human,
+                           pg_size_pretty(Res1.tt_size) table_human,
+                           pg_size_pretty(Res1.tt_size-Res1.bloat_size::bigint) clear_table_human,
+                           case Res1.tt_size when 0
+                                             then '0'
+                                             else round(Res1.bloat_size::numeric/Res1.tt_size*100, 2)||'%' end bloat_proc,
+                           Res1.tbltuples,
+                           Res1.tt_size table_bytes,
+                           to_char(Res1.last_vacuum, 'yyyy-mm-dd hh24:mi') last_vacuum,
+                           to_char(Res1.last_autovacuum, 'yyyy-mm-dd hh24:mi') last_autovacuum,
+                           to_char(Res1.last_analyze, 'yyyy-mm-dd hh24:mi') last_analyze,
+                           to_char(Res1.last_autoanalyze, 'yyyy-mm-dd hh24:mi') last_autoanalyze
+                      from (select res0.schema,
+                                   res0.tablename,
+                                   pg_table_size(res0.toid) tt_size,
+                                   pg_total_relation_size(res0.toid) to_size,
+                                   GREATEST((res0.heappages + res0.toastpages - (ceil(res0.reltuples/
+                                      ((res0.bs-res0.page_hdr) * res0.fillfactor/((4 + res0.tpl_hdr_size
+                                         + res0.tpl_data_size + (2 * res0.ma)
+                                         - CASE WHEN res0.tpl_hdr_size%res0.ma = 0
+                                                THEN res0.ma ELSE res0.tpl_hdr_size%res0.ma END
+                                         - CASE WHEN ceil(res0.tpl_data_size)::int%res0.ma = 0
+                                                THEN res0.ma ELSE ceil(res0.tpl_data_size)::int%res0.ma end)*100)))
+                                  + ceil(res0.toasttuples/4))) * res0.bs, 0) AS bloat_size,
+                                  st.last_vacuum,
+                                  st.last_autovacuum,
+                                  st.last_analyze,
+                                  st.last_autoanalyze,
+                                  res0.reltuples tbltuples
+                                  from (select tbl.oid toid, ns.nspname as schema,
+                                           tbl.relname as tablename,
+                                           tbl.reltuples,
+                                           tbl.relpages as heappages,
+                                           coalesce(substring(array_to_string(tbl.reloptions, ' ')
+                                                 FROM '%fillfactor=#"__#"%' FOR '#')::smallint, 100) AS fillfactor,
+                                           coalesce(toast.relpages, 0) AS toastpages,
+                                           coalesce(toast.reltuples, 0) AS toasttuples,
+                                           current_setting('block_size')::numeric AS bs,
+                                           24 as page_hdr,
+                                           CASE WHEN version()~'mingw32' OR version()~'64-bit|x86_64|ppc64|ia64|amd64'
+                                                THEN 8
+                                                ELSE 4 END AS ma,
+                                           bool_or(att.atttypid = 'pg_catalog.name'::regtype) AS is_na,
+                                           23 + CASE WHEN MAX(coalesce(s.null_frac,0)) > 0
+                                                     THEN ( 7 + count(*) ) / 8
+                                                     ELSE 0::int END + CASE WHEN tbl.relhasoids THEN 4 ELSE 0 END AS tpl_hdr_size,
+                                           sum( (1-coalesce(s.null_frac, 0)) * coalesce(s.avg_width, 1024) ) AS tpl_data_size
+                                          from pg_class tbl
+                                          JOIN pg_namespace AS ns ON ns.oid = tbl.relnamespace
+                                          join pg_attribute as att ON att.attrelid = tbl.oid
+                                          LEFT JOIN pg_class AS toast ON toast.oid = tbl.reltoastrelid
+                                          left JOIN pg_stats AS s ON s.schemaname=ns.nspname
+                                                AND s.tablename = tbl.relname AND s.inherited=false AND s.attname=att.attname
+                                          where tbl.relkind = 'r' and ns.nspname not in ('pg_catalog', 'information_schema')
+                                            and att.attnum > 0 AND NOT att.attisdropped
+                                          group by tbl.oid, ns.nspname, tbl.relname, tbl.reltuples, tbl.relpages,
+                                                   fillfactor, toastpages, toasttuples, tbl.relhasoids) Res0
+                                  left join pg_stat_all_tables st on Res0.schema = st.schemaname and Res0.tablename = st.relname) Res1
+                         order by bloat_size desc
+                         limit """ + str(self.lines_limit)
+
+        if (self.vermajor_a >= 12):
+            ret = self.execute_fetchall(q_after_12)
+        else:
+            ret = self.execute_fetchall(q_before_12)
+
+        col = [('SCHEMA', 0), C('TABLE', left=True), ('TOTAL_BYTES', 0),
+               '*BLOAT_SZ', 'ACTUAL\nTBL_SZ', 'CLEAR\nTBL_SZ', "BLOAT%",
+               ("ROWS", 10, "%d"), ('TABLE_BYTES', 0), 'VACUUM', 'AUTO_VACUUM', 'ANALYZE',
+               'AUTO_ANALYZE']
+
+        hint = "HINT: The bigger is table's BLOAT_SZ the slower are all operations on this table"
+
+        self.add_table("All tables sorted by BLOAT_SZ", col, ret, hint)
+
+    def print_idx_bloat_info(self):
+        section = "All indexes sorted by BLOAT%"
+
+        if not self.issuperuser:
+            s = self.add_section(section)
+            s.add_node(R.RText("WARNING: permission denied for relation pg_statistic"))
+            s.add_node(R.RText("HINT: run the program under superuser to see indexes bloat information"))
+            return
+
+        q = """ WITH btree_index_atts AS (
+                    SELECT nspname, relname, reltuples, relpages, indrelid, relam,
+                        regexp_split_to_table(indkey::text, ' ')::smallint AS attnum, indkey,
+                        indexrelid as index_oid, (SELECT pg_get_indexdef (idx.indexrelid)) as def, indisunique,
+                        indisprimary
+                    FROM pg_index as idx
+                    JOIN pg_class ON pg_class.oid=idx.indexrelid
+                    JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
+                    JOIN pg_am ON pg_class.relam = pg_am.oid
+                    WHERE pg_am.amname = 'btree'
+            ),
+                index_item_sizes AS (
+                    SELECT
+                    i.nspname, i.relname, i.reltuples, i.relpages, i.relam,
+                    s.starelid, a.attrelid AS table_oid, index_oid,
+                    current_setting('block_size')::numeric AS bs,
+                    /* MAXALIGN: 4 on 32bits, 8 on 64bits (and mingw32 ?) */
+                    CASE
+                        WHEN version() ~ 'mingw32' OR version() ~ '64-bit' THEN 8
+                        ELSE 4
+                    END AS maxalign,
+                    24 AS pagehdr,
+                    /* per tuple header: add index_attribute_bm if some cols are null-able */
+                    CASE WHEN max(coalesce(s.stanullfrac,0)) = 0
+                        THEN 2
+                        ELSE 6
+                    END AS index_tuple_hdr,
+                    /* data len: we remove null values save space using it fractionnal part from stats */
+                    sum( (1-coalesce(s.stanullfrac, 0)) * coalesce(s.stawidth, 2048) ) AS nulldatawidth,
+                    i.def as def, indisunique, indisprimary
+                    FROM pg_attribute AS a
+                    JOIN pg_statistic AS s ON s.starelid=a.attrelid AND s.staattnum = a.attnum
+                    JOIN btree_index_atts AS i ON i.indrelid = a.attrelid AND a.attnum = i.attnum
+                    WHERE a.attnum > 0
+                    GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, def, indisunique, indisprimary
+                ),
+                index_aligned AS (
+                    SELECT maxalign, bs, nspname, relname AS index_name, reltuples,
+                        relpages, relam, table_oid, index_oid,
+                      ( 2 +
+                          maxalign - CASE /* Add padding to the index tuple header to align on MAXALIGN */
+                            WHEN index_tuple_hdr%maxalign = 0 THEN maxalign
+                            ELSE index_tuple_hdr%maxalign
+                          END
+                        + nulldatawidth + maxalign - CASE /* Add padding to the data to align on MAXALIGN */
+                            WHEN nulldatawidth::integer%maxalign = 0 THEN maxalign
+                            ELSE nulldatawidth::integer%maxalign
+                          END
+                      )::numeric AS nulldatahdrwidth, pagehdr, def, indisunique, indisprimary
+                    FROM index_item_sizes AS s1
+                ),
+                otta_calc AS (
+                  SELECT bs, nspname, table_oid, index_oid, index_name, relpages, coalesce(
+                    ceil((reltuples*(4+nulldatahdrwidth))/(bs-pagehdr::float)) +
+                      CASE WHEN am.amname IN ('hash','btree') THEN 1 ELSE 0 END , 0 -- btree and hash have a metadata reserved block
+                    ) AS otta, def, indisunique, indisprimary
+                  FROM index_aligned AS s2
+                    LEFT JOIN pg_am am ON s2.relam = am.oid
+                ),
+                raw_bloat AS (
+                    SELECT nspname, c.relname AS table_name, index_name,
+                        bs*(sub.relpages)::bigint AS totalbytes,
+                        CASE
+                            WHEN sub.relpages <= otta THEN 0
+                            ELSE bs*(sub.relpages-otta)::bigint END
+                            AS wastedbytes,
+                        CASE
+                            WHEN sub.relpages <= otta
+                            THEN 0 ELSE bs*(sub.relpages-otta)::bigint * 100 / (bs*(sub.relpages)::bigint) END
+                            AS realbloat,
+                        pg_relation_size(sub.table_oid) as table_bytes,
+                        stat.idx_scan as index_scans,  sub.def as def, sub.indisunique as indisunique, sub.indisprimary as indisprimary
+                    FROM otta_calc AS sub
+                    JOIN pg_class AS c ON c.oid=sub.table_oid
+                    JOIN pg_stat_user_indexes AS stat ON sub.index_oid = stat.indexrelid
+                )
+                SELECT nspname as schema_name,
+                    table_name,
+                    index_name,
+                    pg_size_pretty(wastedbytes::bigint) as bloat_size,
+                    pg_size_pretty(totalbytes::bigint) as index_size,
+                    pg_size_pretty(totalbytes::bigint - wastedbytes::bigint) as clean_size,
+                    pg_size_pretty(table_bytes) as table_size,
+                    round(realbloat, 1) as realbloat, index_scans, --def,
+                    indisprimary
+                FROM raw_bloat
+                WHERE realbloat > 0
+                ORDER BY wastedbytes DESC
+                limit """ + str(self.lines_limit)
+
+        ret = self.execute_fetchall(q)
+
+        col = [('SCHEMA', 10), C('TABLE', left=True), C('INDEX', left=True),
+               ('BLOAT_SZ', 9), ('ACTUAL\nIDX_SZ', 8), ('CLEAN\nIDX_SZ', 8), ('TBL_SZ', 8), ("*BLOAT%", 6), ("INDEX\nSCANS", 8), ("ISPRIMARY", 9)]
+
+        hint = "HINT: Indexes with heavy bloat size reduces read performance and require rebuilding using REINDEX INDEX\n" + \
+               "      VACUUM FULL table_name also eliminates index bloat"
+
+        self.add_table(section, col, ret, hint)
+
+    def print_session_stats(self):
+        s = self.add_section("Transaction statistics")
+
+        if (self.vermajor_a == 9) and (self.vermajor_b <= 1):
+            q_agr = """
+            select datname, usename,
+                   case when waiting then 'true' else 'false' end locked,
+                   case current_query when '<IDLE>' then 'idle'
+                                      when '<IDLE> in transaction' then 'idle in transaction'
+                                      else 'active' end state,
+                   count(*),
+                   to_char(min(backend_start), 'yyyy-mm-dd hh24:mi:ss') session_start_time_min,
+                   date_trunc('second', now()) - date_trunc('second', min(backend_start)) session_duration,
+                   to_char(min(xact_start), 'yyyy-mm-dd hh24:mi:ss') transaction_start_time_min,
+                   date_trunc('second', now()) - date_trunc('second', min(xact_start)) transaction_duration
+              from pg_stat_activity
+             where procpid != pg_backend_pid()
+             group by datname, usename, locked, state
+             order by transaction_duration desc nulls last, session_duration desc
+            """
+            q_detailed = """
+            select procpid,
+                   coalesce(client_addr::text, '') ||  coalesce(':' || client_port, '') client_info,
+                   to_char(xact_start, 'yyyy-mm-dd hh24:mi:ss') || ' ('
+                     || date_trunc('second', now()) - date_trunc('second',xact_start) || ')' tran_info,
+                   to_char(query_start, 'mm-dd hh24:mi:ss') query_start,
+                   case current_query when '<IDLE>' then 'idle'
+                                      when '<IDLE> in transaction' then 'idle in transaction'
+                                      else 'active' end state,
+                   case when waiting then 'true' else 'false' end locked,
+                   datname, usename, current_query
+              from pg_stat_activity
+             where procpid != pg_backend_pid()
+               and extract(epoch from clock_timestamp() - xact_start) > %d
+             order by xact_start nulls last, locked desc
+            """
+        elif (self.vermajor_a == 9) and (self.vermajor_b <= 5):
+            q_agr = """
+            select datname, usename,
+                   case when waiting then 'true' else 'false' end locked,
+                   state, count(*),
+                   to_char(min(backend_start), 'yyyy-mm-dd hh24:mi:ss') session_start_time_min,
+                   date_trunc('second', now()) - date_trunc('second', min(backend_start)) session_duration,
+                   to_char(min(xact_start), 'yyyy-mm-dd hh24:mi:ss') transaction_start_time_min,
+                   date_trunc('second', now()) - date_trunc('second', min(xact_start)) transaction_duration
+              from pg_stat_activity
+             where pid != pg_backend_pid()
+             group by datname, usename, locked, state
+             order by transaction_duration desc nulls last, session_duration desc
+            """
+            q_detailed = """
+            select pid,
+                   coalesce(client_hostname || '(' || client_addr || ')', client_addr::text) ||
+                     coalesce(':' || client_port, '') client_info,
+                   to_char(xact_start, 'yyyy-mm-dd hh24:mi:ss') || ' ('
+                     || date_trunc('second', now()) - date_trunc('second',xact_start) || ')' tran_info,
+                   to_char(query_start, 'mm-dd hh24:mi:ss') query_start,
+                   state, case when waiting then 'true' else 'false' end locked,
+                   datname, usename, query
+              from pg_stat_activity
+             where pid != pg_backend_pid()
+               and extract(epoch from clock_timestamp() - xact_start) > %d
+             order by xact_start nulls last, locked desc
+            """
+        elif (self.vermajor_a == 9) and (self.vermajor_b > 5) or (self.vermajor_a > 9):
+            q_agr = """
+            select datname, usename,
+                   case when wait_event_type is null then 'false' else 'true' end as locked,
+                   state, count(*),
+                   to_char(min(backend_start), 'yyyy-mm-dd hh24:mi:ss') session_start_time_min,
+                   date_trunc('second', now()) - date_trunc('second', min(backend_start)) session_duration,
+                   to_char(min(xact_start), 'yyyy-mm-dd hh24:mi:ss') transaction_start_time_min,
+                   date_trunc('second', now()) - date_trunc('second', min(xact_start)) transaction_duration
+              from pg_stat_activity
+             where pid != pg_backend_pid()
+             group by datname, usename, locked, state
+             order by transaction_duration desc nulls last, session_duration desc
+            """
+            q_detailed = """
+            select pid,
+                   coalesce(client_hostname || '(' || client_addr || ')', client_addr::text) ||
+                     coalesce(':' || client_port, '') client_info,
+                   to_char(xact_start, 'yyyy-mm-dd hh24:mi:ss') || ' ('
+                     || date_trunc('second', now()) - date_trunc('second',xact_start) || ')' tran_info,
+                   to_char(query_start, 'mm-dd hh24:mi:ss') query_start,
+                   state, coalesce(wait_event_type, 'false') as locked,
+                   datname, usename, query
+              from pg_stat_activity
+             where pid != pg_backend_pid()
+               and extract(epoch from clock_timestamp() - xact_start) > %d
+             order by xact_start nulls last, locked desc
+            """
+
+        ret = self.execute_fetchall(q_agr)
+        col = [('DATABASE', 11), ('USERNAME', 15), ('LOCKED', 7), ('STATE', 19), ('COUNT', 5), ('SESSION_START_TIME_MIN', 0),
+               ('OLDEST SESSION DURATION', 23), ('TX_START_TIME_MIN', 0), ('OLDEST TRANSACTION DURATION*', 28)]
+        hint = "HINT: Long-running transactions can affect database performance"
+        self.add_table(s.add_section("Transaction aggregated information"), col, ret, hint)
+
+        ret = self.execute_fetchall(q_detailed % (self.tran_threshold))
+        if ret:
+            col = [('PID', 6), ('CLIENT INFO', 23), ('TRANSACTION INFO', 38), ('QUERY START', 14),
+                   ('STATE', 19), ('LOCKED', 7), ('DATABASE', 11), ('USERNAME', 15), ('QUERY', 0)]
+            self.add_table(s.add_section("Top longest transaction details"), col, ret)
+
+            col = [('PID', 6), ('CLIENT INFO', 0), ('TRANSACTION INFO', 0), ('QUERY START', 0), ('STATE', 0),
+                   ('LOCKED', 0), ('DATABASE', 0), ('USERNAME', 0), C('QUERY', width=123, wrap=True)]
+            self.add_table(s.add_section("Top longest transaction queries"), col, ret)
+
+    def print_most_writable_tables(self, pg_rel_size_threshold):
+        q = """
+         SELECT t.schemaname, t.relname AS tablename,
+            pg_size_pretty(pg_relation_size(t.relid)) AS tsize,
+            coalesce(t.n_tup_upd, 0)*2 + coalesce(t.n_tup_ins, 0) + coalesce(t.n_tup_del, 0) AS WRITE,
+            coalesce(t.seq_scan, 0) + coalesce(t.idx_scan, 0) AS READ,
+            case when coalesce(t.seq_scan, 0) + coalesce(t.idx_scan, 0) > 0 THEN
+                   100 * (coalesce(t.n_tup_upd, 0) + coalesce(t.n_tup_ins, 0) + coalesce(t.n_tup_del, 0)) /
+                     (coalesce(t.n_tup_upd, 0) + coalesce(t.n_tup_ins, 0) + coalesce(t.n_tup_del, 0) + coalesce(t.seq_scan, 0) + coalesce(t.idx_scan, 0))
+            ELSE 0 END,
+            coalesce(t.n_tup_ins, 0) AS INS,
+            coalesce(t.n_tup_del, 0) AS DEL,
+            coalesce(t.n_tup_upd, 0) AS UPD,
+            coalesce(t.n_tup_hot_upd,0) hot_upd,
+            round(case t.n_tup_upd when 0 then 100.0 else 100.0*coalesce(t.n_tup_hot_upd, 0) / t.n_tup_upd end, 2) hot_percent,
+            coalesce(substring(array_to_string(c.reloptions, ' ') FROM '%%fillfactor=#"__#"%%' FOR '#')::smallint, 100) AS fillfactor
+          FROM pg_stat_all_tables t
+          JOIN pg_class c ON c.oid = t.relid
+         where t.schemaname not in ('pg_catalog', 'pg_global')
+           and pg_relation_size(relid) >= %d
+         ORDER BY write DESC
+         LIMIT %d
+        """ % (pg_rel_size_threshold, self.lines_limit)
+
+        ret = self.execute_fetchall(q)
+
+        col = ['SCHEMA', ('TABLE', -32), 'TSIZE', '*WRITES', 'READS', ('WRITE%', None, "%.0f%%"), 'INS', 'DEL', 'UPD', 'HOT UPD', 'HOT%', 'FFAC']
+
+        hint = "HINT: Tables with significant amount of WRITEs can reveal bad application design\n" + \
+               "      Tables with significant amount of updates and low HOT rate are good candidates to set fillfactor (FFAC) lower than 100"
+
+        self.add_table("Most frequently modified tables", col, ret, hint)
+
+    def print_replication_info(self):
+        if (self.vermajor_a == 9) and (self.vermajor_b > 1) or (self.vermajor_a > 9):
+            if self.vermajor_a >= 10:
+                q = """
+                    select coalesce(client_hostname || '(' || client_addr || ')', client_addr::text) client_info,
+                            to_char(backend_start, 'yyyy-mm-dd hh24:mi:ss') backend_start, state, sync_state,
+                            pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn)) send_lag,
+                            pg_size_pretty(pg_wal_lsn_diff(sent_lsn, replay_lsn)) apply_lag
+                       from pg_stat_replication
+                      order by sync_state desc, client_info
+                    """
+            else:
+                sent_location = "sent_location"
+                pg_current_wal_lsn = "pg_current_xlog_location()"
+
+                q = """
+                    select coalesce(client_hostname || '(' || client_addr || ')', client_addr::text) client_info,
+                            to_char(backend_start, 'yyyy-mm-dd hh24:mi:ss') backend_start, state, sync_state,
+                            pg_size_pretty(pg_xlog_location_diff(pg_current_xlog_location(), sent_location)) send_lag,
+                            pg_size_pretty(pg_xlog_location_diff(sent_location, replay_location)) apply_lag
+                       from pg_stat_replication
+                      order by sync_state desc, client_info
+                    """
+
+            ret = self.execute_fetchall(q)
+
+            col = [('STANDBY HOST', 20), ('STANDBY ATTACH TIME', 20), ('WAL SENDER STATE', 18),
+                   ('STANDBY STATE*', 10), ('SEND LAG', 15), ('STANDBY APPLY LAG', 15)]
+
+            hint = "HINT: Big values of send or apply lag may indicate either a huge update on the master, or a standby problem.\n" + \
+                   "      Send lag may indicate that network bandwidth is not sufficient for the existing database write activity.\n" + \
+                   "      Apply lag may indicate that the standby's server performance is not enough."
+
+            self.add_table("Streaming replication information", col, ret, hint)
+
+
+def main():
+    print("pg-info version: %3s" % VERSION)
+
+    test_description = "%prog [options] [REPORT_FILE1, [REPORT_FILE2, ...]]"
+
+    p = OptionParser(test_description)
+    p.add_option("-l", "--lines", type=int, default=40, help="num of lines in output (default %default)")
+    p.add_option("-t", "--tran-threshold", type=int, default=120, help="long transactions threshold in seconds (default %default)")
+    p.add_option("", "--min-tab-size", type=int, default=(32 * 1024),
+                 help="min size of tables when analyze missing indexes (default %default)")
+    p.add_option("-C", "--compare", action="store_true", help="compare report files (passed as arguments)")
+
+    DBReport.add_options(p, DB)
+
+    opts, args = p.parse_args()
+
+    if opts.compare:
+        PgInfoCmp(sorted(args), opts)
+        return
+
+    pi = PgInfo(opts.lines, opts.tran_threshold)
+    pi.init(opts, DB)
+
+    pi.print_db_settings()
+    pi.pprint_db_stats()
+    pi.print_bg_stats()
+    pi.print_schema_size()
+    pi.print_tables_size()
+    pi.print_tbl_bloat_info()
+    pi.print_idx_bloat_info()
+    pi.print_missing_indexes(opts.min_tab_size)
+    pi.print_ineffective_indexes(opts.min_tab_size)
+    pi.print_dead_indexes()
+    pi.print_most_writable_tables(opts.min_tab_size)
+    pi.print_session_stats()
+    pi.print_vacuum_stats(opts.min_tab_size)
+    pi.print_replication_info()
+
+    pi.finish()
+
+
+if __name__ == "__main__":
+    main()
