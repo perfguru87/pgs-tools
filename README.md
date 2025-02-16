@@ -4,6 +4,28 @@ pgs-tools is a collection of tools for PostgreSQL system administration.
 
 # Installation
 
+## Prerequisites
+
+Before installing pgs-tools, you need to have:
+
+1. Python 3.x
+2. PostgreSQL development files
+
+On Debian/Ubuntu systems:
+```bash
+sudo apt-get install python3-dev libpq-dev
+```
+
+On RedHat/CentOS systems:
+```bash
+sudo dnf install python3-devel libpq-devel
+```
+
+On macOS with Homebrew:
+```bash
+brew install postgresql
+```
+
 ## Using pip and virtual environment
 
 1. Create and activate a virtual environment:
@@ -13,7 +35,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-2. Install the package:
+2. Install the requirements:
 
 ```bash
 pip install -r requirements.txt
@@ -25,6 +47,20 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
+## Troubleshooting
+
+If you encounter the error "pg_config executable not found" when installing psycopg2:
+
+1. Ensure PostgreSQL development files are installed (see Prerequisites above)
+2. If PostgreSQL is installed in a non-standard location, set the PATH:
+```bash
+export PATH=$PATH:/path/to/postgresql/bin
+```
+3. Alternatively, you can install psycopg2-binary instead:
+```bash
+pip install psycopg2-binary
+```
+Note: psycopg2-binary is a pre-built version that doesn't require pg_config, but it's not recommended for production use.
 
 # Usage
 
